@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { jidNormalizedUser } from "@whiskeysockets/baileys";
+import type { P } from "pino";
 
 import {
   type Message as DbMessage,
@@ -12,10 +13,21 @@ import {
   getMessagesAround,
   searchDbForContacts,
   searchMessages,
-} from "./database.ts";
+} from "./db/queries.ts";
 
-import { sendWhatsAppMessage, type WhatsAppSocket } from "./whatsapp.ts";
-import { type P } from "pino";
+import {
+  createSession,
+  deleteSession,
+  getSession,
+  listSessions,
+  requireSession,
+  sendSessionMessage,
+} from "./sessions.ts";
+
+const sessionIdSchema = z
+  .string()
+  .min(1)
+  .describe("WhatsApp session ID (from create_session or list_sessions)");
 
 function formatDbMessageForJson(msg: DbMessage) {
   return {
@@ -51,8 +63,45 @@ function formatDbChatForJson(chat: DbChat) {
   };
 }
 
+function formatSessionForJson(session: {
+  id: string;
+  name: string;
+  status: string;
+  phoneJid: string | null;
+  qrUrl: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}) {
+  return {
+    session_id: session.id,
+    name: session.name,
+    status: session.status,
+    phone_jid: session.phoneJid,
+    qr_url: session.qrUrl,
+    created_at: session.createdAt ?? null,
+    updated_at: session.updatedAt ?? null,
+  };
+}
+
+function toolError(message: string) {
+  return {
+    isError: true as const,
+    content: [{ type: "text" as const, text: message }],
+  };
+}
+
+function toolJson(data: unknown) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(data, null, 2),
+      },
+    ],
+  };
+}
+
 export async function startMcpServer(
-  sock: WhatsAppSocket | null,
   mcpLogger: P.Logger,
   waLogger: P.Logger,
 ): Promise<void> {
@@ -60,7 +109,7 @@ export async function startMcpServer(
 
   const server = new McpServer({
     name: "whatsapp-baileys-ts",
-    version: "0.1.0",
+    version: "0.2.0",
     capabilities: {
       tools: {},
       resources: {},
@@ -68,44 +117,114 @@ export async function startMcpServer(
   });
 
   server.tool(
-    "search_contacts",
+    "create_session",
     {
-      query: z
+      name: z
         .string()
         .min(1)
-        .describe("Search term for contact name or phone number part of JID"),
+        .describe("Human-readable name for this WhatsApp session"),
     },
-    async ({ query }) => {
-      mcpLogger.info(
-        `[MCP Tool] Executing search_contacts with query: "${query}"`,
-      );
+    async ({ name }) => {
+      mcpLogger.info(`[MCP Tool] create_session name="${name}"`);
       try {
-        const contacts = searchDbForContacts(query, 20);
-        const formattedContacts = contacts.map((c) => ({
-          jid: c.jid,
-          name: c.name ?? c.jid.split("@")[0],
-        }));
+        const session = await createSession(name);
+        return toolJson(formatSessionForJson(session));
+      } catch (error: any) {
+        mcpLogger.error(
+          `[MCP Tool Error] create_session failed: ${error.message}`,
+        );
+        return toolError(`Error creating session: ${error.message}`);
+      }
+    },
+  );
+
+  server.tool("list_sessions", {}, async () => {
+    mcpLogger.info("[MCP Tool] list_sessions");
+    try {
+      const sessions = listSessions().map(formatSessionForJson);
+      return toolJson(sessions);
+    } catch (error: any) {
+      mcpLogger.error(
+        `[MCP Tool Error] list_sessions failed: ${error.message}`,
+      );
+      return toolError(`Error listing sessions: ${error.message}`);
+    }
+  });
+
+  server.tool(
+    "get_session",
+    {
+      session_id: sessionIdSchema,
+    },
+    async ({ session_id }) => {
+      mcpLogger.info(`[MCP Tool] get_session ${session_id}`);
+      try {
+        const session = getSession(session_id);
+        if (!session) {
+          return toolError(`Session not found: ${session_id}`);
+        }
+        return toolJson(formatSessionForJson(session));
+      } catch (error: any) {
+        mcpLogger.error(
+          `[MCP Tool Error] get_session failed: ${error.message}`,
+        );
+        return toolError(`Error getting session: ${error.message}`);
+      }
+    },
+  );
+
+  server.tool(
+    "delete_session",
+    {
+      session_id: sessionIdSchema,
+    },
+    async ({ session_id }) => {
+      mcpLogger.info(`[MCP Tool] delete_session ${session_id}`);
+      try {
+        await deleteSession(session_id);
         return {
           content: [
             {
-              type: "text",
-              text: JSON.stringify(formattedContacts, null, 2),
+              type: "text" as const,
+              text: `Session ${session_id} deleted (auth + stored data removed).`,
             },
           ],
         };
       } catch (error: any) {
         mcpLogger.error(
+          `[MCP Tool Error] delete_session failed: ${error.message}`,
+        );
+        return toolError(`Error deleting session: ${error.message}`);
+      }
+    },
+  );
+
+  server.tool(
+    "search_contacts",
+    {
+      session_id: sessionIdSchema,
+      query: z
+        .string()
+        .min(1)
+        .describe("Search term for contact name or phone number part of JID"),
+    },
+    async ({ session_id, query }) => {
+      mcpLogger.info(
+        `[MCP Tool] search_contacts session=${session_id} query="${query}"`,
+      );
+      try {
+        requireSession(session_id);
+        const contacts = searchDbForContacts(session_id, query, 20);
+        const formattedContacts = contacts.map((c) => ({
+          jid: c.jid,
+          name: c.name ?? c.jid.split("@")[0],
+        }));
+        return toolJson(formattedContacts);
+      } catch (error: any) {
+        mcpLogger.error(
           `[MCP Tool Error] search_contacts failed: ${error.message}`,
         );
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `Error searching contacts: ${error.message}`,
-            },
-          ],
-        };
+        return toolError(`Error searching contacts: ${error.message}`);
       }
     },
   );
@@ -113,6 +232,7 @@ export async function startMcpServer(
   server.tool(
     "list_messages",
     {
+      session_id: sessionIdSchema,
       chat_jid: z
         .string()
         .describe(
@@ -133,50 +253,40 @@ export async function startMcpServer(
         .default(0)
         .describe("Page number (0-indexed, default 0)"),
     },
-    async ({ chat_jid, limit, page }) => {
+    async ({ session_id, chat_jid, limit, page }) => {
       mcpLogger.info(
-        `[MCP Tool] Executing list_messages for chat ${chat_jid}, limit=${limit}, page=${page}`,
+        `[MCP Tool] list_messages session=${session_id} chat=${chat_jid} limit=${limit} page=${page}`,
       );
       try {
-        const messages = getMessages(chat_jid, limit, page);
+        requireSession(session_id);
+        const messages = getMessages(session_id, chat_jid, limit, page);
         if (!messages.length && page === 0) {
           return {
             content: [
-              { type: "text", text: `No messages found for chat ${chat_jid}.` },
+              {
+                type: "text" as const,
+                text: `No messages found for chat ${chat_jid}.`,
+              },
             ],
           };
         } else if (!messages.length) {
           return {
             content: [
               {
-                type: "text",
+                type: "text" as const,
                 text: `No more messages found on page ${page} for chat ${chat_jid}.`,
               },
             ],
           };
         }
-        const formattedMessages = messages.map(formatDbMessageForJson);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(formattedMessages, null, 2),
-            },
-          ],
-        };
+        return toolJson(messages.map(formatDbMessageForJson));
       } catch (error: any) {
         mcpLogger.error(
           `[MCP Tool Error] list_messages failed for ${chat_jid}: ${error.message}`,
         );
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `Error listing messages for ${chat_jid}: ${error.message}`,
-            },
-          ],
-        };
+        return toolError(
+          `Error listing messages for ${chat_jid}: ${error.message}`,
+        );
       }
     },
   );
@@ -184,6 +294,7 @@ export async function startMcpServer(
   server.tool(
     "list_chats",
     {
+      session_id: sessionIdSchema,
       limit: z
         .number()
         .int()
@@ -213,12 +324,21 @@ export async function startMcpServer(
         .default(true)
         .describe("Include last message details (default true)"),
     },
-    async ({ limit, page, sort_by, query, include_last_message }) => {
+    async ({
+      session_id,
+      limit,
+      page,
+      sort_by,
+      query,
+      include_last_message,
+    }) => {
       mcpLogger.info(
-        `[MCP Tool] Executing list_chats: limit=${limit}, page=${page}, sort=${sort_by}, query=${query}, lastMsg=${include_last_message}`,
+        `[MCP Tool] list_chats session=${session_id} limit=${limit} page=${page} sort=${sort_by}`,
       );
       try {
+        requireSession(session_id);
         const chats = getChats(
+          session_id,
           limit,
           page,
           sort_by,
@@ -229,7 +349,7 @@ export async function startMcpServer(
           return {
             content: [
               {
-                type: "text",
+                type: "text" as const,
                 text: `No chats found${query ? ` matching "${query}"` : ""}.`,
               },
             ],
@@ -238,7 +358,7 @@ export async function startMcpServer(
           return {
             content: [
               {
-                type: "text",
+                type: "text" as const,
                 text: `No more chats found on page ${page}${
                   query ? ` matching "${query}"` : ""
                 }.`,
@@ -246,23 +366,10 @@ export async function startMcpServer(
             ],
           };
         }
-        const formattedChats = chats.map(formatDbChatForJson);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(formattedChats, null, 2),
-            },
-          ],
-        };
+        return toolJson(chats.map(formatDbChatForJson));
       } catch (error: any) {
         mcpLogger.error(`[MCP Tool Error] list_chats failed: ${error.message}`);
-        return {
-          isError: true,
-          content: [
-            { type: "text", text: `Error listing chats: ${error.message}` },
-          ],
-        };
+        return toolError(`Error listing chats: ${error.message}`);
       }
     },
   );
@@ -270,6 +377,7 @@ export async function startMcpServer(
   server.tool(
     "get_chat",
     {
+      session_id: sessionIdSchema,
       chat_jid: z.string().describe("The JID of the chat to retrieve"),
       include_last_message: z
         .boolean()
@@ -277,42 +385,24 @@ export async function startMcpServer(
         .default(true)
         .describe("Include last message details (default true)"),
     },
-    async ({ chat_jid, include_last_message }) => {
+    async ({ session_id, chat_jid, include_last_message }) => {
       mcpLogger.info(
-        `[MCP Tool] Executing get_chat for ${chat_jid}, lastMsg=${include_last_message}`,
+        `[MCP Tool] get_chat session=${session_id} chat=${chat_jid}`,
       );
       try {
-        const chat = getChat(chat_jid, include_last_message);
+        requireSession(session_id);
+        const chat = getChat(session_id, chat_jid, include_last_message);
         if (!chat) {
-          return {
-            isError: true,
-            content: [
-              { type: "text", text: `Chat with JID ${chat_jid} not found.` },
-            ],
-          };
+          return toolError(`Chat with JID ${chat_jid} not found.`);
         }
-        const formattedChat = formatDbChatForJson(chat);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(formattedChat, null, 2),
-            },
-          ],
-        };
+        return toolJson(formatDbChatForJson(chat));
       } catch (error: any) {
         mcpLogger.error(
           `[MCP Tool Error] get_chat failed for ${chat_jid}: ${error.message}`,
         );
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `Error retrieving chat ${chat_jid}: ${error.message}`,
-            },
-          ],
-        };
+        return toolError(
+          `Error retrieving chat ${chat_jid}: ${error.message}`,
+        );
       }
     },
   );
@@ -320,6 +410,7 @@ export async function startMcpServer(
   server.tool(
     "get_message_context",
     {
+      session_id: sessionIdSchema,
       message_id: z
         .string()
         .describe("The ID of the target message to get context around"),
@@ -338,49 +429,33 @@ export async function startMcpServer(
         .default(5)
         .describe("Number of messages after (default 5)"),
     },
-    async ({ message_id, before, after }) => {
+    async ({ session_id, message_id, before, after }) => {
       mcpLogger.info(
-        `[MCP Tool] Executing get_message_context for msg ${message_id}, before=${before}, after=${after}`,
+        `[MCP Tool] get_message_context session=${session_id} msg=${message_id}`,
       );
       try {
-        const context = getMessagesAround(message_id, before, after);
+        requireSession(session_id);
+        const context = getMessagesAround(
+          session_id,
+          message_id,
+          before,
+          after,
+        );
         if (!context.target) {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text: `Message with ID ${message_id} not found.`,
-              },
-            ],
-          };
+          return toolError(`Message with ID ${message_id} not found.`);
         }
-        const formattedContext = {
+        return toolJson({
           target: formatDbMessageForJson(context.target),
           before: context.before.map(formatDbMessageForJson),
           after: context.after.map(formatDbMessageForJson),
-        };
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(formattedContext, null, 2),
-            },
-          ],
-        };
+        });
       } catch (error: any) {
         mcpLogger.error(
-          `[MCP Tool Error] get_message_context failed for ${message_id}: ${error.message}`,
+          `[MCP Tool Error] get_message_context failed: ${error.message}`,
         );
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `Error retrieving context for message ${message_id}: ${error.message}`,
-            },
-          ],
-        };
+        return toolError(
+          `Error retrieving context for message ${message_id}: ${error.message}`,
+        );
       }
     },
   );
@@ -388,6 +463,7 @@ export async function startMcpServer(
   server.tool(
     "send_message",
     {
+      session_id: sessionIdSchema,
       recipient: z
         .string()
         .describe(
@@ -395,45 +471,30 @@ export async function startMcpServer(
         ),
       message: z.string().min(1).describe("The text message to send"),
     },
-    async ({ recipient, message }) => {
-      mcpLogger.info(`[MCP Tool] Executing send_message to ${recipient}`);
-      if (!sock) {
-        mcpLogger.error(
-          "[MCP Tool Error] send_message failed: WhatsApp socket is not available.",
-        );
-        return {
-          isError: true,
-          content: [
-            { type: "text", text: "Error: WhatsApp connection is not active." },
-          ],
-        };
-      }
+    async ({ session_id, recipient, message }) => {
+      mcpLogger.info(
+        `[MCP Tool] send_message session=${session_id} to=${recipient}`,
+      );
 
       let normalizedRecipient: string;
       try {
+        requireSession(session_id);
         normalizedRecipient = jidNormalizedUser(recipient);
         if (!normalizedRecipient.includes("@")) {
           throw new Error('JID must contain "@" symbol');
         }
       } catch (normError: any) {
         mcpLogger.error(
-          `[MCP Tool Error] Invalid recipient JID format: ${recipient}. Error: ${normError.message}`,
+          `[MCP Tool Error] Invalid recipient or session: ${normError.message}`,
         );
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `Invalid recipient format: "${recipient}". Please provide a valid JID (e.g., number@s.whatsapp.net or group@g.us).`,
-            },
-          ],
-        };
+        return toolError(
+          `Invalid request: ${normError.message}. Provide a valid session_id and JID.`,
+        );
       }
 
       try {
-        const result = await sendWhatsAppMessage(
-          waLogger,
-          sock,
+        const result = await sendSessionMessage(
+          session_id,
           normalizedRecipient,
           message,
         );
@@ -442,32 +503,20 @@ export async function startMcpServer(
           return {
             content: [
               {
-                type: "text",
+                type: "text" as const,
                 text: `Message sent successfully to ${normalizedRecipient} (ID: ${result.key.id}).`,
               },
             ],
           };
-        } else {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text: `Failed to send message to ${normalizedRecipient}. See server logs for details.`,
-              },
-            ],
-          };
         }
+        return toolError(
+          `Failed to send message to ${normalizedRecipient}. See server logs for details.`,
+        );
       } catch (error: any) {
         mcpLogger.error(
-          `[MCP Tool Error] send_message failed for ${recipient}: ${error.message}`,
+          `[MCP Tool Error] send_message failed: ${error.message}`,
         );
-        return {
-          isError: true,
-          content: [
-            { type: "text", text: `Error sending message: ${error.message}` },
-          ],
-        };
+        return toolError(`Error sending message: ${error.message}`);
       }
     },
   );
@@ -475,6 +524,7 @@ export async function startMcpServer(
   server.tool(
     "search_messages",
     {
+      session_id: sessionIdSchema,
       query: z
         .string()
         .min(1)
@@ -483,7 +533,7 @@ export async function startMcpServer(
         .string()
         .optional()
         .describe(
-          "Optional: The JID of a specific chat to search within (e.g., '123...net' or 'group@g.us'). If omitted, searches all chats.",
+          "Optional: The JID of a specific chat to search within. If omitted, searches all chats.",
         ),
       limit: z
         .number()
@@ -500,67 +550,64 @@ export async function startMcpServer(
         .default(0)
         .describe("Page number (0-indexed, default 0)"),
     },
-    async ({ chat_jid, query, limit, page }) => {
+    async ({ session_id, chat_jid, query, limit, page }) => {
       const searchScope = chat_jid ? `in chat ${chat_jid}` : "across all chats";
       mcpLogger.info(
-        `[MCP Tool] Executing search_messages ${searchScope}, query="${query}", limit=${limit}, page=${page}`,
+        `[MCP Tool] search_messages session=${session_id} ${searchScope} query="${query}"`,
       );
       try {
-        const messages = searchMessages(query, chat_jid, limit, page);
+        requireSession(session_id);
+        const messagesList = searchMessages(
+          session_id,
+          query,
+          chat_jid,
+          limit,
+          page,
+        );
 
-        if (!messages.length && page === 0) {
+        if (!messagesList.length && page === 0) {
           return {
             content: [
               {
-                type: "text",
-                text: `No messages found containing "${query}" in chat ${chat_jid}.`,
+                type: "text" as const,
+                text: `No messages found containing "${query}"${
+                  chat_jid ? ` in chat ${chat_jid}` : ""
+                }.`,
               },
             ],
           };
-        } else if (!messages.length) {
+        } else if (!messagesList.length) {
           return {
             content: [
               {
-                type: "text",
-                text: `No more messages found containing "${query}" on page ${page} for chat ${chat_jid}.`,
+                type: "text" as const,
+                text: `No more messages found containing "${query}" on page ${page}.`,
               },
             ],
           };
         }
 
-        const formattedMessages = messages.map(formatDbMessageForJson);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(formattedMessages, null, 2),
-            },
-          ],
-        };
+        return toolJson(messagesList.map(formatDbMessageForJson));
       } catch (error: any) {
         mcpLogger.error(
-          `[MCP Tool Error] search_messages_in_chat failed for ${chat_jid} / "${query}": ${error.message}`,
+          `[MCP Tool Error] search_messages failed: ${error.message}`,
         );
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `Error searching messages in chat ${chat_jid}: ${error.message}`,
-            },
-          ],
-        };
+        return toolError(`Error searching messages: ${error.message}`);
       }
     },
   );
 
+  // waLogger kept for parity / future per-tool WA logging
+  void waLogger;
+
   server.resource("db_schema", "schema://whatsapp/main", async (uri) => {
     mcpLogger.info(`[MCP Resource] Request for ${uri.href}`);
     const schemaText = `
-TABLE chats (jid TEXT PK, name TEXT, last_message_time TIMESTAMP)
-TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP, is_from_me BOOLEAN, PK(id, chat_jid), FK(chat_jid) REFERENCES chats(jid))
-TABLE contacts (jid TEXT PK, name TEXT, notify TEXT, phone_number TEXT)
-TABLE jid_mapping (phone_jid TEXT, lid TEXT, PK(phone_jid, lid))
+TABLE sessions (id TEXT PK, name TEXT UNIQUE, status TEXT, phone_jid TEXT, created_at TEXT, updated_at TEXT)
+TABLE chats (session_id TEXT, jid TEXT, name TEXT, last_message_time TEXT, PK(session_id, jid), FK(session_id) REFERENCES sessions(id))
+TABLE messages (session_id TEXT, id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TEXT, is_from_me BOOLEAN, PK(session_id, id, chat_jid), FK(session_id) REFERENCES sessions(id))
+TABLE contacts (session_id TEXT, jid TEXT, name TEXT, notify TEXT, phone_number TEXT, PK(session_id, jid), FK(session_id) REFERENCES sessions(id))
+TABLE jid_mapping (session_id TEXT, phone_jid TEXT, lid TEXT, PK(session_id, phone_jid, lid), FK(session_id) REFERENCES sessions(id))
             `.trim();
     return {
       contents: [

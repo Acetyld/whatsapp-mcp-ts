@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "whatsapp": {
-      "command": "npm",
-      "args": ["run", "mcp"],
+      "command": "bun",
+      "args": ["{{PATH_TO_REPO}}/src/main.ts"],
       "cwd": "{{PATH_TO_REPO}}",
       "timeout": 30,
       "disabled": false

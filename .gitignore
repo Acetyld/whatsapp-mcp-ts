@@ -1,4 +1,4 @@
-# Node dependencies
+# Node / Bun dependencies
 node_modules/
 
 # Build output
@@ -22,3 +22,6 @@ data/
 .DS_Store
 Thumbs.db
 .roo
+
+# npm lockfile (project uses Bun)
+package-lock.json
