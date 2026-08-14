@@ -559,6 +559,8 @@ export async function startMcpServer(
     const schemaText = `
 TABLE chats (jid TEXT PK, name TEXT, last_message_time TIMESTAMP)
 TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP, is_from_me BOOLEAN, PK(id, chat_jid), FK(chat_jid) REFERENCES chats(jid))
+TABLE contacts (jid TEXT PK, name TEXT, notify TEXT, phone_number TEXT)
+TABLE jid_mapping (phone_jid TEXT, lid TEXT, PK(phone_jid, lid))
             `.trim();
     return {
       contents: [

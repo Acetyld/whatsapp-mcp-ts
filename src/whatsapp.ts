@@ -9,6 +9,7 @@ import {
   type proto,
   isJidGroup,
   isJidUser,
+  isLidUser,
   jidNormalizedUser,
 } from "@whiskeysockets/baileys";
 import P from "pino";
@@ -20,6 +21,7 @@ import {
   storeMessage,
   storeChat,
   storeContact,
+  storeJidMapping,
   type Message as DbMessage,
 } from "./database.ts";
 
@@ -34,17 +36,61 @@ function phoneFromJid(jid: string | undefined): string | null {
 
 function contactToStore(contact: Partial<Contact> & { id: string }) {
   const jid = jidNormalizedUser(contact.id);
-  const phoneJid = contact.phoneNumber
-    ? jidNormalizedUser(contact.phoneNumber)
-    : null;
+  const lid = contact.lid ? jidNormalizedUser(contact.lid) : null;
+  // Installed Baileys Contact has `lid`; newer forks may also expose `phoneNumber`.
+  const phoneJid = (contact as Contact & { phoneNumber?: string }).phoneNumber
+    ? jidNormalizedUser((contact as Contact & { phoneNumber?: string }).phoneNumber!)
+    : isJidUser(jid)
+      ? jid
+      : null;
+
+  if (phoneJid && lid) {
+    maybeStoreJidMapping(phoneJid, lid);
+  } else if (phoneJid && isLidUser(jid)) {
+    maybeStoreJidMapping(phoneJid, jid);
+  } else if (isJidUser(jid) && lid) {
+    maybeStoreJidMapping(jid, lid);
+  }
 
   return {
     jid,
     name: contact.name ?? null,
     notify: contact.notify ?? null,
-    phoneNumber:
-      phoneFromJid(phoneJid ?? undefined) ?? phoneFromJid(jid) ?? null,
+    phoneNumber: phoneFromJid(phoneJid ?? undefined) ?? phoneFromJid(jid) ?? null,
   };
+}
+
+function maybeStoreJidMapping(phoneJid: string | null, lid: string | null) {
+  if (phoneJid && lid && isJidUser(phoneJid) && isLidUser(lid)) {
+    storeJidMapping(jidNormalizedUser(phoneJid), jidNormalizedUser(lid));
+  }
+}
+
+function storeChatWithLidMapping(chat: {
+  id?: string | null;
+  lidJid?: string | null;
+  name?: string | null;
+  conversationTimestamp?: number | null;
+}) {
+  if (!chat.id) return;
+
+  const jid = jidNormalizedUser(chat.id);
+  storeChat({
+    jid,
+    name: chat.name ?? undefined,
+    last_message_time: chat.conversationTimestamp
+      ? new Date(Number(chat.conversationTimestamp) * 1000)
+      : undefined,
+  });
+
+  if (chat.lidJid) {
+    const lid = jidNormalizedUser(chat.lidJid);
+    if (isJidUser(jid)) {
+      maybeStoreJidMapping(jid, lid);
+    } else if (isLidUser(jid)) {
+      maybeStoreJidMapping(lid, jid);
+    }
+  }
 }
 
 function storeContactFromMessage(msg: WAMessage): void {
@@ -72,7 +118,6 @@ function parseMessageForDb(msg: WAMessage): DbMessage | null {
   }
 
   let content: string | null = null;
-  const messageType = Object.keys(msg.message)[0];
 
   if (msg.message.conversation) {
     content = msg.message.conversation;
@@ -104,14 +149,10 @@ function parseMessageForDb(msg: WAMessage): DbMessage | null {
     return null;
   }
 
-  // Use WhatsApp's original message timestamp (seconds since epoch)
   let timestampSeconds: number;
-
   if (msg.messageTimestamp != null) {
-    // Handles number, bigint, and Long-like objects
     timestampSeconds = Number(msg.messageTimestamp);
   } else {
-    // Fallback only if WA didn't give us a timestamp at all
     timestampSeconds = Date.now() / 1000;
   }
 
@@ -135,29 +176,15 @@ function parseMessageForDb(msg: WAMessage): DbMessage | null {
   };
 }
 
-export async function startWhatsAppConnection(
-  logger: P.Logger
-): Promise<WhatsAppSocket> {
-  initializeDatabase();
-
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version, isLatest } = await fetchLatestBaileysVersion();
-  logger.info(`Using WA v${version.join(".")}, isLatest: ${isLatest}`);
-
-  const sock = makeWASocket({
-    version,
-    logger,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
-    syncFullHistory: false,
-    shouldSyncHistoryMessage: () => false,
-    generateHighQualityLinkPreview: true,
-    shouldIgnoreJid: (jid) => isJidGroup(jid),
-  });
-
-  sock.ev.process(async (events) => {
+function bindSocketEvents(
+  sock: WhatsAppSocket,
+  logger: P.Logger,
+  saveCreds: () => Promise<void>,
+  onOpen: () => void,
+  onLoggedOut: () => void,
+  scheduleReconnect: (dead: WhatsAppSocket) => void,
+): () => void {
+  return sock.ev.process(async (events) => {
     if (events["connection.update"]) {
       const update = events["connection.update"];
       const { connection, lastDisconnect, qr } = update;
@@ -165,9 +192,8 @@ export async function startWhatsAppConnection(
       if (qr) {
         logger.info(
           { qrCodeData: qr },
-          "QR Code Received. Copy the qrCodeData string and use a QR code generator (e.g., online website) to display and scan it with your WhatsApp app."
+          "QR Code Received. Copy the qrCodeData string and use a QR code generator (e.g., online website) to display and scan it with your WhatsApp app.",
         );
-        // for now we roughly open the QR code in a browser
         await open(`https://quickchart.io/qr?text=${encodeURIComponent(qr)}`);
       }
 
@@ -177,20 +203,16 @@ export async function startWhatsAppConnection(
           `Connection closed. Reason: ${
             DisconnectReason[statusCode as number] || "Unknown"
           }`,
-          lastDisconnect?.error
+          lastDisconnect?.error,
         );
         if (statusCode !== DisconnectReason.loggedOut) {
-          logger.info("Reconnecting...");
-          startWhatsAppConnection(logger);
+          scheduleReconnect(sock);
         } else {
-          logger.error(
-            "Connection closed: Logged Out. Please delete auth_info and restart."
-          );
-          process.exit(1);
+          onLoggedOut();
         }
       } else if (connection === "open") {
         logger.info(`Connection opened. WA user: ${sock.user?.name}`);
-        // console.log("Logged as", sock.user?.name);
+        onOpen();
       }
     }
 
@@ -200,24 +222,16 @@ export async function startWhatsAppConnection(
     }
 
     if (events["messaging-history.set"]) {
-      const { chats, contacts, messages, isLatest, progress, syncType } =
-        events["messaging-history.set"];
+      const { chats, contacts, messages } = events["messaging-history.set"];
       if (contacts.length > 0) {
         logger.info(`Storing ${contacts.length} contacts from history sync.`);
-        contacts.forEach((c) => storeContact(contactToStore(c)));
-        logger.info(`Stored ${contacts.length} contacts from history sync.`);
+        contacts.forEach((c) => {
+          storeContact(contactToStore(c));
+        });
       }
 
       logger.info(`Storing ${chats.length} chats from history sync.`);
-      chats.forEach((chat) =>
-        storeChat({
-          jid: chat.id,
-          name: chat.name,
-          last_message_time: chat.conversationTimestamp
-            ? new Date(Number(chat.conversationTimestamp) * 1000)
-            : undefined,
-        })
-      );
+      chats.forEach((chat) => storeChatWithLidMapping(chat));
 
       let storedCount = 0;
       messages.forEach((msg) => {
@@ -234,7 +248,7 @@ export async function startWhatsAppConnection(
       const { messages, type } = events["messages.upsert"];
       logger.info(
         { type, count: messages.length },
-        "Received messages.upsert event"
+        "Received messages.upsert event",
       );
 
       if (type === "notify") {
@@ -250,13 +264,13 @@ export async function startWhatsAppConnection(
                 fromMe: parsed.is_from_me,
                 sender: parsed.sender,
               },
-              `Storing message: ${parsed.content.substring(0, 50)}...`
+              `Storing message: ${parsed.content.substring(0, 50)}...`,
             );
             storeMessage(parsed);
           } else {
             logger.warn(
               { msgId: msg.key?.id, chatId: msg.key?.remoteJid },
-              "Skipped storing message (parsing failed or unsupported type)"
+              "Skipped storing message (parsing failed or unsupported type)",
             );
           }
         }
@@ -266,32 +280,20 @@ export async function startWhatsAppConnection(
     if (events["chats.upsert"]) {
       logger.info(
         { count: events["chats.upsert"].length },
-        "Received chats.upsert event"
+        "Received chats.upsert event",
       );
       for (const chat of events["chats.upsert"]) {
-        storeChat({
-          jid: chat.id!,
-          name: chat.name,
-          last_message_time: chat.conversationTimestamp
-            ? new Date(Number(chat.conversationTimestamp) * 1000)
-            : undefined,
-        });
+        storeChatWithLidMapping(chat);
       }
     }
 
     if (events["chats.update"]) {
       logger.info(
         { count: events["chats.update"].length },
-        "Received chats.update event"
+        "Received chats.update event",
       );
       for (const chatUpdate of events["chats.update"]) {
-        storeChat({
-          jid: chatUpdate.id!,
-          name: chatUpdate.name,
-          last_message_time: chatUpdate.conversationTimestamp
-            ? new Date(Number(chatUpdate.conversationTimestamp) * 1000)
-            : undefined,
-        });
+        storeChatWithLidMapping(chatUpdate);
       }
     }
 
@@ -299,8 +301,10 @@ export async function startWhatsAppConnection(
       const { lid, jid } = events["chats.phoneNumberShare"];
       logger.info({ lid, jid }, "Received chats.phoneNumberShare event");
       const phoneJid = jidNormalizedUser(jid);
+      const lidJid = jidNormalizedUser(lid);
+      maybeStoreJidMapping(phoneJid, lidJid);
       storeContact({
-        jid: jidNormalizedUser(lid),
+        jid: lidJid,
         phoneNumber: phoneFromJid(phoneJid),
       });
       storeContact({
@@ -312,7 +316,7 @@ export async function startWhatsAppConnection(
     if (events["contacts.upsert"]) {
       logger.info(
         { count: events["contacts.upsert"].length },
-        "Received contacts.upsert event"
+        "Received contacts.upsert event",
       );
       for (const contact of events["contacts.upsert"]) {
         storeContact(contactToStore(contact));
@@ -322,7 +326,7 @@ export async function startWhatsAppConnection(
     if (events["contacts.update"]) {
       logger.info(
         { count: events["contacts.update"].length },
-        "Received contacts.update event"
+        "Received contacts.update event",
       );
       for (const contact of events["contacts.update"]) {
         if (!contact.id?.includes("@")) continue;
@@ -330,19 +334,152 @@ export async function startWhatsAppConnection(
       }
     }
   });
+}
 
-  return sock;
+/**
+ * Open a self-healing WhatsApp connection.
+ * Returns a stable Proxy that always delegates to the live socket.
+ */
+export async function startWhatsAppConnection(
+  logger: P.Logger,
+): Promise<WhatsAppSocket> {
+  initializeDatabase();
+
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  logger.info(`Using WA v${version.join(".")}, isLatest: ${isLatest}`);
+
+  let currentSock: WhatsAppSocket | null = null;
+  let detach: (() => void) | null = null;
+  let reconnecting = false;
+  let attempts = 0;
+  const BASE_DELAY_MS = 1_000;
+  const MAX_DELAY_MS = 30_000;
+
+  let resolveInitialConnection: (() => void) | null = null;
+  let rejectInitialConnection: ((err: Error) => void) | null = null;
+  let initialConnectionResolved = false;
+
+  const initialConnectionReady = new Promise<void>((resolve, reject) => {
+    resolveInitialConnection = resolve;
+    rejectInitialConnection = reject;
+  });
+
+  // Fresh QR login can take longer than a reconnect; only soft-timeout registered sessions.
+  const alreadyRegistered = Boolean(state.creds?.me?.id);
+  const connectionTimeout = setTimeout(() => {
+    if (!initialConnectionResolved) {
+      rejectInitialConnection?.(
+        new Error(
+          alreadyRegistered
+            ? "WA connection timeout after 30s"
+            : "WA connection timeout after 120s (QR not scanned?)",
+        ),
+      );
+      rejectInitialConnection = null;
+      resolveInitialConnection = null;
+    }
+  }, alreadyRegistered ? 30_000 : 120_000);
+
+  const onOpen = () => {
+    if (!initialConnectionResolved) {
+      initialConnectionResolved = true;
+      clearTimeout(connectionTimeout);
+      resolveInitialConnection?.();
+      resolveInitialConnection = null;
+    }
+    attempts = 0;
+  };
+
+  const onLoggedOut = () => {
+    clearTimeout(connectionTimeout);
+    rejectInitialConnection?.(new Error("Logged out"));
+    rejectInitialConnection = null;
+    resolveInitialConnection = null;
+    logger.error(
+      "Connection closed: Logged Out. Please delete auth_info and restart.",
+    );
+    process.exit(1);
+  };
+
+  const teardown = (dead: WhatsAppSocket) => {
+    if (currentSock === dead) {
+      currentSock = null;
+    }
+    try {
+      detach?.();
+    } catch {}
+    detach = null;
+    try {
+      dead.end(undefined);
+    } catch {}
+  };
+
+  const scheduleReconnect = (dead: WhatsAppSocket) => {
+    if (reconnecting) return;
+    reconnecting = true;
+    teardown(dead);
+    const delay = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * 2 ** attempts);
+    attempts++;
+    logger.info(`Reconnecting in ${delay}ms (attempt ${attempts})`);
+    setTimeout(() => {
+      reconnecting = false;
+      connect();
+    }, delay);
+  };
+
+  const connect = () => {
+    const sock = makeWASocket({
+      version,
+      logger,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      syncFullHistory: false,
+      shouldSyncHistoryMessage: () => false,
+      generateHighQualityLinkPreview: true,
+      shouldIgnoreJid: (jid) => isJidGroup(jid),
+    });
+    currentSock = sock;
+
+    detach = bindSocketEvents(
+      sock,
+      logger,
+      saveCreds,
+      onOpen,
+      onLoggedOut,
+      scheduleReconnect,
+    );
+  };
+
+  connect();
+
+  await initialConnectionReady;
+
+  return new Proxy({} as WhatsAppSocket, {
+    get(_target, prop) {
+      if (!currentSock) return undefined;
+      const value = (currentSock as any)[prop];
+      return typeof value === "function" ? value.bind(currentSock) : value;
+    },
+    set(_target, prop, value) {
+      if (!currentSock) return true;
+      (currentSock as any)[prop] = value;
+      return true;
+    },
+  });
 }
 
 export async function sendWhatsAppMessage(
   logger: P.Logger,
   sock: WhatsAppSocket | null,
   recipientJid: string,
-  text: string
+  text: string,
 ): Promise<proto.WebMessageInfo | void> {
   if (!sock || !sock.user) {
     logger.error(
-      "Cannot send message: WhatsApp socket not connected or initialized."
+      "Cannot send message: WhatsApp socket not connected or initialized.",
     );
     return;
   }
@@ -357,7 +494,7 @@ export async function sendWhatsAppMessage(
 
   try {
     logger.info(
-      `Sending message to ${recipientJid}: ${text.substring(0, 50)}...`
+      `Sending message to ${recipientJid}: ${text.substring(0, 50)}...`,
     );
     const normalizedJid = jidNormalizedUser(recipientJid);
     const result = await sock.sendMessage(normalizedJid, { text: text });

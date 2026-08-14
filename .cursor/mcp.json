@@ -3,7 +3,6 @@
     "whatsapp": {
       "command": "npm",
       "args": ["run", "mcp"],
-      "cwd": "/Users/diongrendelman/Projects/dion/baileys",
       "timeout": 30,
       "disabled": false
     }

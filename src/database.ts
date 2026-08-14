@@ -62,7 +62,7 @@ export function initializeDatabase(): DatabaseSync {
         );
     `);
 
-    db.exec(`
+  db.exec(`
       CREATE TABLE IF NOT EXISTS contacts (
         jid TEXT PRIMARY KEY,
         name TEXT,
@@ -70,6 +70,26 @@ export function initializeDatabase(): DatabaseSync {
         phone_number TEXT
       );
     `);
+
+  db.exec(`
+      CREATE TABLE IF NOT EXISTS jid_mapping (
+        phone_jid TEXT NOT NULL,
+        lid TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (phone_jid, lid)
+      );
+    `);
+
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_jid_mapping_lid ON jid_mapping (lid);`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_jid_mapping_phone ON jid_mapping (phone_jid);`,
+  );
+
+  db.exec(
+    `UPDATE chats SET last_message_time = NULL WHERE last_message_time IN ('undefined', 'null', '');`,
+  );
 
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages (timestamp);`,
@@ -87,6 +107,103 @@ export function initializeDatabase(): DatabaseSync {
   return db;
 }
 
+function normalizeChatTimestamp(
+  value: Date | string | null | undefined,
+): string | null {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (value == null || String(value) === "undefined" || String(value) === "null") {
+    return null;
+  }
+  return String(value);
+}
+
+export function chatExists(jid: string): boolean {
+  const db = getDb();
+  const row = db.prepare("SELECT 1 FROM chats WHERE jid = ?").get(jid);
+  return row != null;
+}
+
+export function storeJidMapping(phoneJid: string, lid: string): void {
+  const db = getDb();
+  try {
+    const stmt = db.prepare(`
+      INSERT INTO jid_mapping (phone_jid, lid)
+      VALUES (@phone_jid, @lid)
+      ON CONFLICT(phone_jid, lid) DO NOTHING
+    `);
+    stmt.run({ phone_jid: phoneJid, lid });
+  } catch (error) {
+    console.error("Error storing jid mapping:", error);
+  }
+}
+
+function lookupMappedJid(jid: string): string | null {
+  const db = getDb();
+  const asPhone = db
+    .prepare("SELECT lid FROM jid_mapping WHERE phone_jid = ? LIMIT 1")
+    .get(jid) as { lid: string } | undefined;
+  if (asPhone?.lid) return asPhone.lid;
+
+  const asLid = db
+    .prepare("SELECT phone_jid FROM jid_mapping WHERE lid = ? LIMIT 1")
+    .get(jid) as { phone_jid: string } | undefined;
+  return asLid?.phone_jid ?? null;
+}
+
+function chatHasMessages(jid: string): boolean {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT 1 FROM messages WHERE chat_jid = ? LIMIT 1")
+    .get(jid);
+  return row != null;
+}
+
+/** Resolve phone JID, LID, or bare number to the chat JID stored in the DB. */
+export function resolveChatJid(input: string): string {
+  let jid = input.trim();
+  if (!jid.includes("@")) {
+    const digits = jid.replace(/\D/g, "");
+    jid = digits ? `${digits}@s.whatsapp.net` : jid;
+  }
+
+  const mapped = lookupMappedJid(jid);
+  const candidates = [jid, mapped].filter(
+    (value, index, arr): value is string =>
+      Boolean(value) && arr.indexOf(value) === index,
+  );
+
+  // Prefer the JID that actually has messages (LID chats often hold them).
+  for (const candidate of candidates) {
+    if (chatHasMessages(candidate)) return candidate;
+  }
+
+  for (const candidate of candidates) {
+    if (chatExists(candidate)) return candidate;
+  }
+
+  const db = getDb();
+  const phonePart = jid.split("@")[0];
+  const contactRow = db
+    .prepare(
+      `SELECT jid FROM contacts
+       WHERE phone_number = ? OR jid = ? OR phone_number LIKE ?
+       LIMIT 1`,
+    )
+    .get(phonePart, jid, `%${phonePart}%`) as { jid: string } | undefined;
+  if (contactRow?.jid) {
+    if (chatHasMessages(contactRow.jid)) return contactRow.jid;
+    if (chatExists(contactRow.jid)) return contactRow.jid;
+    const contactMapped = lookupMappedJid(contactRow.jid);
+    if (contactMapped && chatHasMessages(contactMapped)) return contactMapped;
+    if (contactMapped && chatExists(contactMapped)) return contactMapped;
+  }
+
+  // Prefer mapped LID when phone chat is empty / missing.
+  return mapped ?? jid;
+}
+
 export function storeChat(chat: Partial<Chat> & { jid: string }): void {
   const db = getDb();
   try {
@@ -100,12 +217,7 @@ export function storeChat(chat: Partial<Chat> & { jid: string }): void {
     stmt.run({
       jid: chat.jid,
       name: chat.name ?? null,
-      last_message_time:
-        chat.last_message_time instanceof Date
-          ? chat.last_message_time.toISOString()
-          : chat.last_message_time === null
-            ? null
-            : String(chat.last_message_time),
+      last_message_time: normalizeChatTimestamp(chat.last_message_time),
     });
   } catch (error) {
     console.error("Error storing chat:", error);
@@ -185,6 +297,7 @@ export function getMessages(
   page: number = 0,
 ): Message[] {
   const db = getDb();
+  const resolvedJid = resolveChatJid(chatJid);
   try {
     const offset = page * limit;
     const stmt = db.prepare(`
@@ -196,7 +309,7 @@ export function getMessages(
             LIMIT ?             -- Positional parameter 2
             OFFSET ?            -- Positional parameter 3
         `);
-    const rows = stmt.all(chatJid, limit, offset) as any[];
+    const rows = stmt.all(resolvedJid, limit, offset) as any[];
     return rows.map(rowToMessage);
   } catch (error) {
     console.error("Error getting messages:", error);
@@ -262,6 +375,7 @@ export function getChat(
   includeLastMessage: boolean = true,
 ): Chat | null {
   const db = getDb();
+  const resolvedJid = resolveChatJid(jid);
   try {
     let sql = `
             SELECT
@@ -283,7 +397,7 @@ export function getChat(
         `;
 
     const stmt = db.prepare(sql);
-    const row = stmt.get(jid) as any | undefined;
+    const row = stmt.get(resolvedJid) as any | undefined;
     return row ? rowToChat(row) : null;
   } catch (error) {
     console.error("Error getting chat:", error);
@@ -417,7 +531,7 @@ export function searchMessages(
 
     if (chatJid) {
       sql += ` AND m.chat_jid = ?`;
-      params.push(chatJid);
+      params.push(resolveChatJid(chatJid));
     }
 
     sql += ` ORDER BY m.timestamp DESC`;
