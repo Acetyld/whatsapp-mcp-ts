@@ -3,7 +3,7 @@
     "whatsapp": {
       "command": "npm",
       "args": ["run", "mcp"],
-      "cwd": "{{PATH_TO_REPO}}",
+      "cwd": "/Users/diongrendelman/Projects/dion/baileys",
       "timeout": 30,
       "disabled": false
     }

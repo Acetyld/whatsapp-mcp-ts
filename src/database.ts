@@ -361,16 +361,27 @@ export function searchDbForContacts(
     const pattern = `%${query}%`;
 
     const stmt = db.prepare(`
-      SELECT
-        jid,
-        COALESCE(name, notify, phone_number, jid) AS display_name
-      FROM contacts
-      WHERE
-        LOWER(COALESCE(name, notify, phone_number, jid)) LIKE LOWER(?)
+      SELECT jid, display_name FROM (
+        SELECT
+          jid,
+          COALESCE(name, notify, phone_number, jid) AS display_name
+        FROM contacts
+        WHERE LOWER(COALESCE(name, notify, phone_number, jid)) LIKE LOWER(?)
+
+        UNION
+
+        SELECT
+          c.jid,
+          COALESCE(c.name, ct.name, ct.notify, ct.phone_number, c.jid) AS display_name
+        FROM chats c
+        LEFT JOIN contacts ct ON c.jid = ct.jid
+        WHERE LOWER(COALESCE(c.name, ct.name, ct.notify, ct.phone_number, c.jid)) LIKE LOWER(?)
+          AND c.jid NOT IN (SELECT jid FROM contacts)
+      )
       LIMIT ?
     `);
 
-    const rows = stmt.all(pattern, limit) as {
+    const rows = stmt.all(pattern, pattern, limit) as {
       jid: string;
       display_name: string | null;
     }[];

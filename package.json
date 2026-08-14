@@ -7,6 +7,10 @@
   "author": "jlucaso",
   "license": "ISC",
   "description": "",
+  "scripts": {
+    "start": "node src/main.ts",
+    "mcp": "node src/main.ts"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.8.0",
     "@whiskeysockets/baileys": "^6.7.16",

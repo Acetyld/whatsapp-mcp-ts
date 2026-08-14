@@ -5,8 +5,10 @@ import {
   makeCacheableSignalKeyStore,
   DisconnectReason,
   type WAMessage,
+  type Contact,
   type proto,
   isJidGroup,
+  isJidUser,
   jidNormalizedUser,
 } from "@whiskeysockets/baileys";
 import P from "pino";
@@ -24,6 +26,45 @@ import {
 const AUTH_DIR = path.join(import.meta.dirname, "..", "auth_info");
 
 export type WhatsAppSocket = ReturnType<typeof makeWASocket>;
+
+function phoneFromJid(jid: string | undefined): string | null {
+  if (!jid || !isJidUser(jid)) return null;
+  return jid.split("@")[0] ?? null;
+}
+
+function contactToStore(contact: Partial<Contact> & { id: string }) {
+  const jid = jidNormalizedUser(contact.id);
+  const phoneJid = contact.phoneNumber
+    ? jidNormalizedUser(contact.phoneNumber)
+    : null;
+
+  return {
+    jid,
+    name: contact.name ?? null,
+    notify: contact.notify ?? null,
+    phoneNumber:
+      phoneFromJid(phoneJid ?? undefined) ?? phoneFromJid(jid) ?? null,
+  };
+}
+
+function storeContactFromMessage(msg: WAMessage): void {
+  if (!msg.key?.remoteJid || isJidGroup(msg.key.remoteJid)) {
+    return;
+  }
+
+  const jid = jidNormalizedUser(msg.key.remoteJid);
+  const notify = msg.pushName?.trim() || null;
+
+  storeContact({
+    jid,
+    notify,
+    phoneNumber: phoneFromJid(jid),
+  });
+
+  if (notify) {
+    storeChat({ jid, name: notify });
+  }
+}
 
 function parseMessageForDb(msg: WAMessage): DbMessage | null {
   if (!msg.message || !msg.key || !msg.key.remoteJid) {
@@ -110,6 +151,8 @@ export async function startWhatsAppConnection(
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
+    syncFullHistory: false,
+    shouldSyncHistoryMessage: () => false,
     generateHighQualityLinkPreview: true,
     shouldIgnoreJid: (jid) => isJidGroup(jid),
   });
@@ -161,14 +204,7 @@ export async function startWhatsAppConnection(
         events["messaging-history.set"];
       if (contacts.length > 0) {
         logger.info(`Storing ${contacts.length} contacts from history sync.`);
-        contacts.forEach((c) =>
-          storeContact({
-            jid: c.id,
-            name: c.name ?? null,
-            notify: c.notify ?? null,
-            phoneNumber: (c as any).phoneNumber ?? null,
-          })
-        );
+        contacts.forEach((c) => storeContact(contactToStore(c)));
         logger.info(`Stored ${contacts.length} contacts from history sync.`);
       }
 
@@ -201,8 +237,10 @@ export async function startWhatsAppConnection(
         "Received messages.upsert event"
       );
 
-      if (type === "notify" || type === "append") {
+      if (type === "notify") {
         for (const msg of messages) {
+          storeContactFromMessage(msg);
+
           const parsed = parseMessageForDb(msg);
           if (parsed) {
             logger.info(
@@ -225,6 +263,22 @@ export async function startWhatsAppConnection(
       }
     }
 
+    if (events["chats.upsert"]) {
+      logger.info(
+        { count: events["chats.upsert"].length },
+        "Received chats.upsert event"
+      );
+      for (const chat of events["chats.upsert"]) {
+        storeChat({
+          jid: chat.id!,
+          name: chat.name,
+          last_message_time: chat.conversationTimestamp
+            ? new Date(Number(chat.conversationTimestamp) * 1000)
+            : undefined,
+        });
+      }
+    }
+
     if (events["chats.update"]) {
       logger.info(
         { count: events["chats.update"].length },
@@ -238,6 +292,41 @@ export async function startWhatsAppConnection(
             ? new Date(Number(chatUpdate.conversationTimestamp) * 1000)
             : undefined,
         });
+      }
+    }
+
+    if (events["chats.phoneNumberShare"]) {
+      const { lid, jid } = events["chats.phoneNumberShare"];
+      logger.info({ lid, jid }, "Received chats.phoneNumberShare event");
+      const phoneJid = jidNormalizedUser(jid);
+      storeContact({
+        jid: jidNormalizedUser(lid),
+        phoneNumber: phoneFromJid(phoneJid),
+      });
+      storeContact({
+        jid: phoneJid,
+        phoneNumber: phoneFromJid(phoneJid),
+      });
+    }
+
+    if (events["contacts.upsert"]) {
+      logger.info(
+        { count: events["contacts.upsert"].length },
+        "Received contacts.upsert event"
+      );
+      for (const contact of events["contacts.upsert"]) {
+        storeContact(contactToStore(contact));
+      }
+    }
+
+    if (events["contacts.update"]) {
+      logger.info(
+        { count: events["contacts.update"].length },
+        "Received contacts.update event"
+      );
+      for (const contact of events["contacts.update"]) {
+        if (!contact.id?.includes("@")) continue;
+        storeContact(contactToStore(contact as Contact));
       }
     }
   });
@@ -272,6 +361,10 @@ export async function sendWhatsAppMessage(
     );
     const normalizedJid = jidNormalizedUser(recipientJid);
     const result = await sock.sendMessage(normalizedJid, { text: text });
+    storeContact({
+      jid: normalizedJid,
+      phoneNumber: phoneFromJid(normalizedJid),
+    });
     logger.info({ msgId: result?.key.id }, "Message sent successfully");
     return result;
   } catch (error) {
