@@ -10,5 +10,5 @@ startCommand:
   commandFunction:
     # A JS function that produces the CLI command based on the given config to start the MCP on stdio.
     |-
-    (config) => ({ command: 'ts-node', args: ['src/main.ts'], env: {} })
+    (config) => ({ command: 'bun', args: ['src/main.ts'], env: {} })
   exampleConfig: {}

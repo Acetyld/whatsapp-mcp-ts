@@ -1,15 +1,18 @@
 import { pino } from "pino";
-import { initializeDatabase } from "./database.ts";
-import { startWhatsAppConnection, type WhatsAppSocket } from "./whatsapp.ts";
+import { initializeDatabase } from "./db/index.ts";
 import { startMcpServer } from "./mcp.ts";
+import {
+  initSessionManager,
+  restoreSessions,
+} from "./sessions.ts";
 
-const dataDir = process.env.WHATSAPP_MCP_DATA_DIR || '.';
+const dataDir = process.env.WHATSAPP_MCP_DATA_DIR || ".";
 const waLogger = pino(
   {
     level: process.env.LOG_LEVEL || "info",
     timestamp: pino.stdTimeFunctions.isoTime,
   },
-  pino.destination(`${dataDir}/wa-logs.txt`)
+  pino.destination(`${dataDir}/wa-logs.txt`),
 );
 
 const mcpLogger = pino(
@@ -17,34 +20,31 @@ const mcpLogger = pino(
     level: process.env.LOG_LEVEL || "info",
     timestamp: pino.stdTimeFunctions.isoTime,
   },
-  pino.destination(`${dataDir}/mcp-logs.txt`)
+  pino.destination(`${dataDir}/mcp-logs.txt`),
 );
 
 async function main() {
   mcpLogger.info("Starting WhatsApp MCP Server...");
-
-  let whatsappSocket: WhatsAppSocket | null = null;
 
   try {
     mcpLogger.info("Initializing database...");
     initializeDatabase();
     mcpLogger.info("Database initialized successfully.");
 
-    mcpLogger.info("Attempting to connect to WhatsApp...");
-    whatsappSocket = await startWhatsAppConnection(waLogger);
-    mcpLogger.info("WhatsApp connection process initiated.");
+    initSessionManager(waLogger);
+    mcpLogger.info("Restoring WhatsApp sessions with saved credentials...");
+    await restoreSessions();
   } catch (error: any) {
     mcpLogger.fatal(
       { err: error },
-      "Failed during initialization or WhatsApp connection attempt"
+      "Failed during initialization",
     );
-
     process.exit(1);
   }
 
   try {
     mcpLogger.info("Starting MCP server...");
-    await startMcpServer(whatsappSocket, mcpLogger, waLogger);
+    await startMcpServer(mcpLogger, waLogger);
     mcpLogger.info("MCP Server started and listening.");
   } catch (error: any) {
     mcpLogger.fatal({ err: error }, "Failed to start MCP server");

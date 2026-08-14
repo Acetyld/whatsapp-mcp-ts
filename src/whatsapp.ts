@@ -12,70 +12,89 @@ import {
   isLidUser,
   jidNormalizedUser,
 } from "@whiskeysockets/baileys";
-import P from "pino";
+import type { P } from "pino";
+import { existsSync } from "node:fs";
 import path from "node:path";
-import open from "open";
 
 import {
-  initializeDatabase,
   storeMessage,
   storeChat,
   storeContact,
   storeJidMapping,
   type Message as DbMessage,
-} from "./database.ts";
-
-const AUTH_DIR = path.join(import.meta.dirname, "..", "auth_info");
+} from "./db/queries.ts";
 
 export type WhatsAppSocket = ReturnType<typeof makeWASocket>;
+
+export type ConnectionHooks = {
+  onQr?: (qr: string) => void;
+  onOpen?: (phoneJid: string | null) => void;
+  onClose?: (loggedOut: boolean) => void;
+};
 
 function phoneFromJid(jid: string | undefined): string | null {
   if (!jid || !isJidUser(jid)) return null;
   return jid.split("@")[0] ?? null;
 }
 
-function contactToStore(contact: Partial<Contact> & { id: string }) {
+function contactToStore(
+  sessionId: string,
+  contact: Partial<Contact> & { id: string },
+) {
   const jid = jidNormalizedUser(contact.id);
   const lid = contact.lid ? jidNormalizedUser(contact.lid) : null;
-  // Installed Baileys Contact has `lid`; newer forks may also expose `phoneNumber`.
   const phoneJid = (contact as Contact & { phoneNumber?: string }).phoneNumber
-    ? jidNormalizedUser((contact as Contact & { phoneNumber?: string }).phoneNumber!)
+    ? jidNormalizedUser(
+        (contact as Contact & { phoneNumber?: string }).phoneNumber!,
+      )
     : isJidUser(jid)
       ? jid
       : null;
 
   if (phoneJid && lid) {
-    maybeStoreJidMapping(phoneJid, lid);
+    maybeStoreJidMapping(sessionId, phoneJid, lid);
   } else if (phoneJid && isLidUser(jid)) {
-    maybeStoreJidMapping(phoneJid, jid);
+    maybeStoreJidMapping(sessionId, phoneJid, jid);
   } else if (isJidUser(jid) && lid) {
-    maybeStoreJidMapping(jid, lid);
+    maybeStoreJidMapping(sessionId, jid, lid);
   }
 
   return {
     jid,
     name: contact.name ?? null,
     notify: contact.notify ?? null,
-    phoneNumber: phoneFromJid(phoneJid ?? undefined) ?? phoneFromJid(jid) ?? null,
+    phoneNumber:
+      phoneFromJid(phoneJid ?? undefined) ?? phoneFromJid(jid) ?? null,
   };
 }
 
-function maybeStoreJidMapping(phoneJid: string | null, lid: string | null) {
+function maybeStoreJidMapping(
+  sessionId: string,
+  phoneJid: string | null,
+  lid: string | null,
+) {
   if (phoneJid && lid && isJidUser(phoneJid) && isLidUser(lid)) {
-    storeJidMapping(jidNormalizedUser(phoneJid), jidNormalizedUser(lid));
+    storeJidMapping(
+      sessionId,
+      jidNormalizedUser(phoneJid),
+      jidNormalizedUser(lid),
+    );
   }
 }
 
-function storeChatWithLidMapping(chat: {
-  id?: string | null;
-  lidJid?: string | null;
-  name?: string | null;
-  conversationTimestamp?: number | null;
-}) {
+function storeChatWithLidMapping(
+  sessionId: string,
+  chat: {
+    id?: string | null;
+    lidJid?: string | null;
+    name?: string | null;
+    conversationTimestamp?: number | null;
+  },
+) {
   if (!chat.id) return;
 
   const jid = jidNormalizedUser(chat.id);
-  storeChat({
+  storeChat(sessionId, {
     jid,
     name: chat.name ?? undefined,
     last_message_time: chat.conversationTimestamp
@@ -86,14 +105,14 @@ function storeChatWithLidMapping(chat: {
   if (chat.lidJid) {
     const lid = jidNormalizedUser(chat.lidJid);
     if (isJidUser(jid)) {
-      maybeStoreJidMapping(jid, lid);
+      maybeStoreJidMapping(sessionId, jid, lid);
     } else if (isLidUser(jid)) {
-      maybeStoreJidMapping(lid, jid);
+      maybeStoreJidMapping(sessionId, lid, jid);
     }
   }
 }
 
-function storeContactFromMessage(msg: WAMessage): void {
+function storeContactFromMessage(sessionId: string, msg: WAMessage): void {
   if (!msg.key?.remoteJid || isJidGroup(msg.key.remoteJid)) {
     return;
   }
@@ -101,14 +120,14 @@ function storeContactFromMessage(msg: WAMessage): void {
   const jid = jidNormalizedUser(msg.key.remoteJid);
   const notify = msg.pushName?.trim() || null;
 
-  storeContact({
+  storeContact(sessionId, {
     jid,
     notify,
     phoneNumber: phoneFromJid(jid),
   });
 
   if (notify) {
-    storeChat({ jid, name: notify });
+    storeChat(sessionId, { jid, name: notify });
   }
 }
 
@@ -177,12 +196,14 @@ function parseMessageForDb(msg: WAMessage): DbMessage | null {
 }
 
 function bindSocketEvents(
+  sessionId: string,
   sock: WhatsAppSocket,
   logger: P.Logger,
   saveCreds: () => Promise<void>,
   onOpen: () => void,
   onLoggedOut: () => void,
   scheduleReconnect: (dead: WhatsAppSocket) => void,
+  onQr?: (qr: string) => void,
 ): () => void {
   return sock.ev.process(async (events) => {
     if (events["connection.update"]) {
@@ -192,9 +213,9 @@ function bindSocketEvents(
       if (qr) {
         logger.info(
           { qrCodeData: qr },
-          "QR Code Received. Copy the qrCodeData string and use a QR code generator (e.g., online website) to display and scan it with your WhatsApp app.",
+          "QR Code Received. Scan with WhatsApp or open the qr_url from get_session.",
         );
-        await open(`https://quickchart.io/qr?text=${encodeURIComponent(qr)}`);
+        onQr?.(qr);
       }
 
       if (connection === "close") {
@@ -226,18 +247,18 @@ function bindSocketEvents(
       if (contacts.length > 0) {
         logger.info(`Storing ${contacts.length} contacts from history sync.`);
         contacts.forEach((c) => {
-          storeContact(contactToStore(c));
+          storeContact(sessionId, contactToStore(sessionId, c));
         });
       }
 
       logger.info(`Storing ${chats.length} chats from history sync.`);
-      chats.forEach((chat) => storeChatWithLidMapping(chat));
+      chats.forEach((chat) => storeChatWithLidMapping(sessionId, chat));
 
       let storedCount = 0;
       messages.forEach((msg) => {
         const parsed = parseMessageForDb(msg);
         if (parsed) {
-          storeMessage(parsed);
+          storeMessage(sessionId, parsed);
           storedCount++;
         }
       });
@@ -253,7 +274,7 @@ function bindSocketEvents(
 
       if (type === "notify") {
         for (const msg of messages) {
-          storeContactFromMessage(msg);
+          storeContactFromMessage(sessionId, msg);
 
           const parsed = parseMessageForDb(msg);
           if (parsed) {
@@ -266,7 +287,7 @@ function bindSocketEvents(
               },
               `Storing message: ${parsed.content.substring(0, 50)}...`,
             );
-            storeMessage(parsed);
+            storeMessage(sessionId, parsed);
           } else {
             logger.warn(
               { msgId: msg.key?.id, chatId: msg.key?.remoteJid },
@@ -283,7 +304,7 @@ function bindSocketEvents(
         "Received chats.upsert event",
       );
       for (const chat of events["chats.upsert"]) {
-        storeChatWithLidMapping(chat);
+        storeChatWithLidMapping(sessionId, chat);
       }
     }
 
@@ -293,7 +314,7 @@ function bindSocketEvents(
         "Received chats.update event",
       );
       for (const chatUpdate of events["chats.update"]) {
-        storeChatWithLidMapping(chatUpdate);
+        storeChatWithLidMapping(sessionId, chatUpdate);
       }
     }
 
@@ -302,12 +323,12 @@ function bindSocketEvents(
       logger.info({ lid, jid }, "Received chats.phoneNumberShare event");
       const phoneJid = jidNormalizedUser(jid);
       const lidJid = jidNormalizedUser(lid);
-      maybeStoreJidMapping(phoneJid, lidJid);
-      storeContact({
+      maybeStoreJidMapping(sessionId, phoneJid, lidJid);
+      storeContact(sessionId, {
         jid: lidJid,
         phoneNumber: phoneFromJid(phoneJid),
       });
-      storeContact({
+      storeContact(sessionId, {
         jid: phoneJid,
         phoneNumber: phoneFromJid(phoneJid),
       });
@@ -319,7 +340,7 @@ function bindSocketEvents(
         "Received contacts.upsert event",
       );
       for (const contact of events["contacts.upsert"]) {
-        storeContact(contactToStore(contact));
+        storeContact(sessionId, contactToStore(sessionId, contact));
       }
     }
 
@@ -330,28 +351,42 @@ function bindSocketEvents(
       );
       for (const contact of events["contacts.update"]) {
         if (!contact.id?.includes("@")) continue;
-        storeContact(contactToStore(contact as Contact));
+        storeContact(
+          sessionId,
+          contactToStore(sessionId, contact as Contact),
+        );
       }
     }
   });
 }
 
-/**
- * Open a self-healing WhatsApp connection.
- * Returns a stable Proxy that always delegates to the live socket.
- */
-export async function startWhatsAppConnection(
-  logger: P.Logger,
-): Promise<WhatsAppSocket> {
-  initializeDatabase();
+export function hasAuthCreds(authDir: string): boolean {
+  return existsSync(path.join(authDir, "creds.json"));
+}
 
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+/**
+ * Open a self-healing WhatsApp connection for one session.
+ * Returns a stable Proxy that always delegates to the live socket,
+ * plus a stop() to tear down reconnect loops.
+ */
+export async function startWhatsAppConnection(options: {
+  sessionId: string;
+  authDir: string;
+  logger: P.Logger;
+  hooks?: ConnectionHooks;
+  /** When true, waits until connection opens (or times out). Default false for multi-session. */
+  waitForOpen?: boolean;
+}): Promise<{ socket: WhatsAppSocket; stop: () => void }> {
+  const { sessionId, authDir, logger, hooks, waitForOpen = false } = options;
+
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version, isLatest } = await fetchLatestBaileysVersion();
   logger.info(`Using WA v${version.join(".")}, isLatest: ${isLatest}`);
 
   let currentSock: WhatsAppSocket | null = null;
   let detach: (() => void) | null = null;
   let reconnecting = false;
+  let stopped = false;
   let attempts = 0;
   const BASE_DELAY_MS = 1_000;
   const MAX_DELAY_MS = 30_000;
@@ -360,46 +395,57 @@ export async function startWhatsAppConnection(
   let rejectInitialConnection: ((err: Error) => void) | null = null;
   let initialConnectionResolved = false;
 
-  const initialConnectionReady = new Promise<void>((resolve, reject) => {
-    resolveInitialConnection = resolve;
-    rejectInitialConnection = reject;
-  });
+  const initialConnectionReady = waitForOpen
+    ? new Promise<void>((resolve, reject) => {
+        resolveInitialConnection = resolve;
+        rejectInitialConnection = reject;
+      })
+    : Promise.resolve();
 
-  // Fresh QR login can take longer than a reconnect; only soft-timeout registered sessions.
   const alreadyRegistered = Boolean(state.creds?.me?.id);
-  const connectionTimeout = setTimeout(() => {
-    if (!initialConnectionResolved) {
-      rejectInitialConnection?.(
-        new Error(
-          alreadyRegistered
-            ? "WA connection timeout after 30s"
-            : "WA connection timeout after 120s (QR not scanned?)",
-        ),
-      );
-      rejectInitialConnection = null;
-      resolveInitialConnection = null;
-    }
-  }, alreadyRegistered ? 30_000 : 120_000);
+  let connectionTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  if (waitForOpen) {
+    connectionTimeout = setTimeout(() => {
+      if (!initialConnectionResolved) {
+        rejectInitialConnection?.(
+          new Error(
+            alreadyRegistered
+              ? "WA connection timeout after 30s"
+              : "WA connection timeout after 120s (QR not scanned?)",
+          ),
+        );
+        rejectInitialConnection = null;
+        resolveInitialConnection = null;
+      }
+    }, alreadyRegistered ? 30_000 : 120_000);
+  }
 
   const onOpen = () => {
     if (!initialConnectionResolved) {
       initialConnectionResolved = true;
-      clearTimeout(connectionTimeout);
+      if (connectionTimeout) clearTimeout(connectionTimeout);
       resolveInitialConnection?.();
       resolveInitialConnection = null;
     }
     attempts = 0;
+    const phoneJid = state.creds?.me?.id
+      ? jidNormalizedUser(state.creds.me.id)
+      : currentSock?.user?.id
+        ? jidNormalizedUser(currentSock.user.id)
+        : null;
+    hooks?.onOpen?.(phoneJid);
   };
 
   const onLoggedOut = () => {
-    clearTimeout(connectionTimeout);
+    if (connectionTimeout) clearTimeout(connectionTimeout);
     rejectInitialConnection?.(new Error("Logged out"));
     rejectInitialConnection = null;
     resolveInitialConnection = null;
     logger.error(
-      "Connection closed: Logged Out. Please delete auth_info and restart.",
+      "Connection closed: Logged Out. Delete the session or create a new one to re-authenticate.",
     );
-    process.exit(1);
+    hooks?.onClose?.(true);
   };
 
   const teardown = (dead: WhatsAppSocket) => {
@@ -416,19 +462,21 @@ export async function startWhatsAppConnection(
   };
 
   const scheduleReconnect = (dead: WhatsAppSocket) => {
-    if (reconnecting) return;
+    if (stopped || reconnecting) return;
     reconnecting = true;
     teardown(dead);
+    hooks?.onClose?.(false);
     const delay = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * 2 ** attempts);
     attempts++;
     logger.info(`Reconnecting in ${delay}ms (attempt ${attempts})`);
     setTimeout(() => {
       reconnecting = false;
-      connect();
+      if (!stopped) connect();
     }, delay);
   };
 
   const connect = () => {
+    if (stopped) return;
     const sock = makeWASocket({
       version,
       logger,
@@ -444,20 +492,24 @@ export async function startWhatsAppConnection(
     currentSock = sock;
 
     detach = bindSocketEvents(
+      sessionId,
       sock,
       logger,
       saveCreds,
       onOpen,
       onLoggedOut,
       scheduleReconnect,
+      hooks?.onQr,
     );
   };
 
   connect();
 
-  await initialConnectionReady;
+  if (waitForOpen) {
+    await initialConnectionReady;
+  }
 
-  return new Proxy({} as WhatsAppSocket, {
+  const socket = new Proxy({} as WhatsAppSocket, {
     get(_target, prop) {
       if (!currentSock) return undefined;
       const value = (currentSock as any)[prop];
@@ -469,10 +521,30 @@ export async function startWhatsAppConnection(
       return true;
     },
   });
+
+  const stop = () => {
+    stopped = true;
+    if (connectionTimeout) clearTimeout(connectionTimeout);
+    if (currentSock) teardown(currentSock);
+  };
+
+  return { socket, stop };
+}
+
+export async function disconnectWhatsAppSession(
+  sock: WhatsAppSocket | null,
+): Promise<void> {
+  if (!sock) return;
+  try {
+    sock.end(undefined);
+  } catch {
+    // ignore
+  }
 }
 
 export async function sendWhatsAppMessage(
   logger: P.Logger,
+  sessionId: string,
   sock: WhatsAppSocket | null,
   recipientJid: string,
   text: string,
@@ -498,7 +570,7 @@ export async function sendWhatsAppMessage(
     );
     const normalizedJid = jidNormalizedUser(recipientJid);
     const result = await sock.sendMessage(normalizedJid, { text: text });
-    storeContact({
+    storeContact(sessionId, {
       jid: normalizedJid,
       phoneNumber: phoneFromJid(normalizedJid),
     });
