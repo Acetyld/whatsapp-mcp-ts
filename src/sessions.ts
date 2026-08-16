@@ -14,7 +14,7 @@ import {
 import type { SessionStatus } from "./db/schema.ts";
 import {
   disconnectWhatsAppSession,
-  hasAuthCreds,
+  hasRegisteredAuth,
   sendWhatsAppMessage,
   startWhatsAppConnection,
   type WhatsAppSocket,
@@ -93,12 +93,18 @@ function setRuntimeStatus(
   });
 }
 
+function isSessionLockError(error: unknown): boolean {
+  return String((error as Error | undefined)?.message ?? "").includes(
+    "already in use",
+  );
+}
+
 async function startRuntimeConnection(runtime: RuntimeSession): Promise<void> {
   const logger = ensureLogger().child({ sessionId: runtime.id, sessionName: runtime.name });
   const authDir = authDirFor(runtime.id);
 
-  setRuntimeStatus(runtime.id, "connecting", { qrUrl: null });
-
+  // Acquire the authDir lock inside startWhatsAppConnection before mutating
+  // shared DB status, so a second process never marks the peer as connecting.
   const { socket, stop } = await startWhatsAppConnection({
     sessionId: runtime.id,
     authDir,
@@ -120,15 +126,38 @@ async function startRuntimeConnection(runtime: RuntimeSession): Promise<void> {
         if (loggedOut) {
           setRuntimeStatus(runtime.id, "logged_out", { qrUrl: null });
           runtime.socket = null;
-        } else if (runtime.status !== "logged_out") {
+        } else if (
+          runtime.status !== "logged_out" &&
+          runtime.status !== "pending_qr" &&
+          runtime.status !== "disconnected"
+        ) {
+          // Transient reconnect path for already-paired sessions.
           setRuntimeStatus(runtime.id, "connecting", { qrUrl: null });
         }
+      },
+      onPairingStopped: () => {
+        // Keep pending_qr if a QR was shown; otherwise disconnected.
+        // Do not keep reconnecting — wait for create_session / a new QR.
+        const next =
+          runtime.qrUrl || runtime.status === "pending_qr"
+            ? "pending_qr"
+            : "disconnected";
+        setRuntimeStatus(runtime.id, next);
+        runtime.socket = null;
       },
     },
   });
 
   runtime.socket = socket;
   runtime.stop = stop;
+
+  if (
+    runtime.status !== "connected" &&
+    runtime.status !== "pending_qr" &&
+    runtime.status !== "logged_out"
+  ) {
+    setRuntimeStatus(runtime.id, "connecting", { qrUrl: null });
+  }
 }
 
 export function initSessionManager(logger: P.Logger): void {
@@ -238,6 +267,19 @@ export async function deleteSession(sessionId: string): Promise<void> {
   }
 }
 
+/** Stop all live sockets and release authDir locks (for process shutdown). */
+export function stopAllSessions(): void {
+  for (const runtime of runtimes.values()) {
+    try {
+      runtime.stop?.();
+    } catch {
+      // ignore
+    }
+    runtime.socket = null;
+    runtime.stop = null;
+  }
+}
+
 export async function restoreSessions(): Promise<void> {
   const logger = ensureLogger();
   const rows = listSessionRows();
@@ -255,18 +297,32 @@ export async function restoreSessions(): Promise<void> {
     runtimes.set(row.id, runtime);
 
     const authDir = authDirFor(row.id);
-    if (!hasAuthCreds(authDir)) {
-      setRuntimeStatus(row.id, "disconnected");
+    // creds.json exists after a QR bootstrap even when never scanned.
+    // Only restore sockets that completed pairing — unpaired pending_qr
+    // must wait for create_session / a fresh pairing request.
+    if (!hasRegisteredAuth(authDir)) {
+      const status =
+        row.status === "pending_qr" || row.status === "logged_out"
+          ? (row.status as SessionStatus)
+          : "disconnected";
+      setRuntimeStatus(row.id, status);
       logger.info(
-        { sessionId: row.id, name: row.name },
-        "Skipping restore: no saved auth credentials",
+        { sessionId: row.id, name: row.name, status },
+        "Skipping restore: session is not paired (no registered WhatsApp identity)",
       );
       continue;
     }
 
     logger.info({ sessionId: row.id, name: row.name }, "Restoring WhatsApp session");
+    // Non-blocking: MCP handshake must not wait on WhatsApp open.
     void startRuntimeConnection(runtime).catch((error) => {
       logger.error({ err: error, sessionId: row.id }, "Failed to restore session");
+      if (isSessionLockError(error)) {
+        // Another live process owns this authDir. Do not clobber shared DB
+        // status — drop the local runtime entry and leave the peer alone.
+        runtimes.delete(row.id);
+        return;
+      }
       setRuntimeStatus(row.id, "disconnected");
     });
   }
@@ -281,7 +337,12 @@ export async function sendSessionMessage(
   const socket = getSocket(sessionId);
   if (!socket || session.status !== "connected") {
     throw new Error(
-      `Session "${session.name}" is not connected (status: ${session.status}).`,
+      `Session "${session.name}" is not connected (status: ${session.status}). ` +
+        (session.status === "pending_qr"
+          ? "Scan the QR via get_session, or delete and create_session again for a fresh QR."
+          : session.status === "connecting"
+            ? "WhatsApp is still connecting; retry shortly."
+            : "Wait for restore, or create_session / re-pair if this session is unpaired."),
     );
   }
 

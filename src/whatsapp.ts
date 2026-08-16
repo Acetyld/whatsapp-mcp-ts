@@ -13,7 +13,7 @@ import {
   jidNormalizedUser,
 } from "@whiskeysockets/baileys";
 import type { P } from "pino";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import {
@@ -23,6 +23,7 @@ import {
   storeJidMapping,
   type Message as DbMessage,
 } from "./db/queries.ts";
+import { acquireSessionLock, type SessionLock } from "./session-lock.ts";
 
 export type WhatsAppSocket = ReturnType<typeof makeWASocket>;
 
@@ -30,7 +31,18 @@ export type ConnectionHooks = {
   onQr?: (qr: string) => void;
   onOpen?: (phoneJid: string | null) => void;
   onClose?: (loggedOut: boolean) => void;
+  /**
+   * Unpaired QR / pairing retries exhausted; reconnect loop stopped.
+   * Caller should mark the session pending_qr / disconnected and wait
+   * for create_session (or a fresh pairing request).
+   */
+  onPairingStopped?: (reason: string) => void;
 };
+
+/** Cap how many times we reconnect while still unpaired (QR not scanned). */
+const MAX_UNPAIRED_RECONNECTS = 2;
+/** Wall-clock budget for unpaired pairing attempts. */
+const MAX_UNPAIRED_MS = 3 * 60_000;
 
 function phoneFromJid(jid: string | undefined): string | null {
   if (!jid || !isJidUser(jid)) return null;
@@ -202,7 +214,11 @@ function bindSocketEvents(
   saveCreds: () => Promise<void>,
   onOpen: () => void,
   onLoggedOut: () => void,
-  scheduleReconnect: (dead: WhatsAppSocket) => void,
+  scheduleReconnect: (
+    dead: WhatsAppSocket,
+    statusCode: number | undefined,
+    errorMessage: string,
+  ) => void,
   onQr?: (qr: string) => void,
 ): () => void {
   return sock.ev.process(async (events) => {
@@ -220,6 +236,9 @@ function bindSocketEvents(
 
       if (connection === "close") {
         const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+        const errorMessage = String(
+          (lastDisconnect?.error as Error | undefined)?.message ?? "",
+        );
         logger.warn(
           `Connection closed. Reason: ${
             DisconnectReason[statusCode as number] || "Unknown"
@@ -227,7 +246,7 @@ function bindSocketEvents(
           lastDisconnect?.error,
         );
         if (statusCode !== DisconnectReason.loggedOut) {
-          scheduleReconnect(sock);
+          scheduleReconnect(sock, statusCode, errorMessage);
         } else {
           onLoggedOut();
         }
@@ -364,10 +383,27 @@ export function hasAuthCreds(authDir: string): boolean {
   return existsSync(path.join(authDir, "creds.json"));
 }
 
+/** True when auth_info has a paired WhatsApp identity (not just an empty QR bootstrap). */
+export function hasRegisteredAuth(authDir: string): boolean {
+  const credsPath = path.join(authDir, "creds.json");
+  if (!existsSync(credsPath)) return false;
+  try {
+    const creds = JSON.parse(readFileSync(credsPath, "utf8")) as {
+      me?: { id?: string };
+    };
+    return Boolean(creds?.me?.id);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Open a self-healing WhatsApp connection for one session.
  * Returns a stable Proxy that always delegates to the live socket,
  * plus a stop() to tear down reconnect loops.
+ *
+ * Acquires an exclusive lock on authDir so a second process cannot
+ * steal the WhatsApp Web connection (connectionReplaced / conflict).
  */
 export async function startWhatsAppConnection(options: {
   sessionId: string;
@@ -379,156 +415,224 @@ export async function startWhatsAppConnection(options: {
 }): Promise<{ socket: WhatsAppSocket; stop: () => void }> {
   const { sessionId, authDir, logger, hooks, waitForOpen = false } = options;
 
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version, isLatest } = await fetchLatestBaileysVersion();
-  logger.info(`Using WA v${version.join(".")}, isLatest: ${isLatest}`);
+  let lock: SessionLock;
+  try {
+    lock = acquireSessionLock(authDir);
+  } catch (error) {
+    logger.error({ err: error, authDir }, "Refusing to start WhatsApp socket");
+    throw error;
+  }
 
-  let currentSock: WhatsAppSocket | null = null;
-  let detach: (() => void) | null = null;
-  let reconnecting = false;
-  let stopped = false;
-  let attempts = 0;
-  const BASE_DELAY_MS = 1_000;
-  const MAX_DELAY_MS = 30_000;
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    logger.info(`Using WA v${version.join(".")}, isLatest: ${isLatest}`);
 
-  let resolveInitialConnection: (() => void) | null = null;
-  let rejectInitialConnection: ((err: Error) => void) | null = null;
-  let initialConnectionResolved = false;
+    let currentSock: WhatsAppSocket | null = null;
+    let detach: (() => void) | null = null;
+    let reconnecting = false;
+    let stopped = false;
+    let attempts = 0;
+    let unpairedReconnects = 0;
+    let sawQr = false;
+    const unpairedStartedAt = Date.now();
+    const BASE_DELAY_MS = 1_000;
+    const MAX_DELAY_MS = 30_000;
 
-  const initialConnectionReady = waitForOpen
-    ? new Promise<void>((resolve, reject) => {
-        resolveInitialConnection = resolve;
-        rejectInitialConnection = reject;
-      })
-    : Promise.resolve();
+    let resolveInitialConnection: (() => void) | null = null;
+    let rejectInitialConnection: ((err: Error) => void) | null = null;
+    let initialConnectionResolved = false;
 
-  const alreadyRegistered = Boolean(state.creds?.me?.id);
-  let connectionTimeout: ReturnType<typeof setTimeout> | null = null;
+    const initialConnectionReady = waitForOpen
+      ? new Promise<void>((resolve, reject) => {
+          resolveInitialConnection = resolve;
+          rejectInitialConnection = reject;
+        })
+      : Promise.resolve();
 
-  if (waitForOpen) {
-    connectionTimeout = setTimeout(() => {
+    const isPaired = () => Boolean(state.creds?.me?.id);
+    const alreadyRegistered = isPaired();
+    let connectionTimeout: ReturnType<typeof setTimeout> | null = null;
+
+    if (waitForOpen) {
+      connectionTimeout = setTimeout(() => {
+        if (!initialConnectionResolved) {
+          rejectInitialConnection?.(
+            new Error(
+              alreadyRegistered
+                ? "WA connection timeout after 30s"
+                : "WA connection timeout after 120s (QR not scanned?)",
+            ),
+          );
+          rejectInitialConnection = null;
+          resolveInitialConnection = null;
+        }
+      }, alreadyRegistered ? 30_000 : 120_000);
+    }
+
+    const onOpen = () => {
       if (!initialConnectionResolved) {
-        rejectInitialConnection?.(
-          new Error(
-            alreadyRegistered
-              ? "WA connection timeout after 30s"
-              : "WA connection timeout after 120s (QR not scanned?)",
-          ),
-        );
-        rejectInitialConnection = null;
+        initialConnectionResolved = true;
+        if (connectionTimeout) clearTimeout(connectionTimeout);
+        resolveInitialConnection?.();
         resolveInitialConnection = null;
       }
-    }, alreadyRegistered ? 30_000 : 120_000);
-  }
+      attempts = 0;
+      unpairedReconnects = 0;
+      const phoneJid = state.creds?.me?.id
+        ? jidNormalizedUser(state.creds.me.id)
+        : currentSock?.user?.id
+          ? jidNormalizedUser(currentSock.user.id)
+          : null;
+      hooks?.onOpen?.(phoneJid);
+    };
 
-  const onOpen = () => {
-    if (!initialConnectionResolved) {
-      initialConnectionResolved = true;
+    const onLoggedOut = () => {
       if (connectionTimeout) clearTimeout(connectionTimeout);
-      resolveInitialConnection?.();
+      rejectInitialConnection?.(new Error("Logged out"));
+      rejectInitialConnection = null;
       resolveInitialConnection = null;
+      logger.error(
+        "Connection closed: Logged Out. Delete the session or create a new one to re-authenticate.",
+      );
+      hooks?.onClose?.(true);
+    };
+
+    const teardown = (dead: WhatsAppSocket) => {
+      if (currentSock === dead) {
+        currentSock = null;
+      }
+      try {
+        detach?.();
+      } catch {}
+      detach = null;
+      try {
+        dead.end(undefined);
+      } catch {}
+    };
+
+    const stopPairing = (reason: string) => {
+      stopped = true;
+      if (connectionTimeout) clearTimeout(connectionTimeout);
+      rejectInitialConnection?.(new Error(reason));
+      rejectInitialConnection = null;
+      resolveInitialConnection = null;
+      if (currentSock) teardown(currentSock);
+      lock.release();
+      logger.warn(reason);
+      hooks?.onPairingStopped?.(reason);
+    };
+
+    const scheduleReconnect = (
+      dead: WhatsAppSocket,
+      statusCode: number | undefined,
+      errorMessage: string,
+    ) => {
+      if (stopped || reconnecting) return;
+
+      const paired = isPaired();
+      // Baileys ends QR pairing with Boom("QR refs attempts ended", timedOut).
+      // timedOut shares status 408 with connectionLost — key off the message.
+      const qrRefsEnded = errorMessage.includes("QR refs attempts ended");
+
+      if (!paired) {
+        if (
+          qrRefsEnded ||
+          unpairedReconnects >= MAX_UNPAIRED_RECONNECTS ||
+          Date.now() - unpairedStartedAt >= MAX_UNPAIRED_MS
+        ) {
+          teardown(dead);
+          stopPairing(
+            sawQr || qrRefsEnded
+              ? "QR pairing timed out; stopped reconnecting. Create a new session (or delete and recreate) to get a fresh QR."
+              : "Unpaired session failed to connect within the retry budget; stopped reconnecting.",
+          );
+          return;
+        }
+        unpairedReconnects++;
+      }
+
+      reconnecting = true;
+      teardown(dead);
+      hooks?.onClose?.(false);
+      const delay = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * 2 ** attempts);
+      attempts++;
+      logger.info(
+        {
+          attempt: attempts,
+          statusCode,
+          reason: DisconnectReason[statusCode as number] || "Unknown",
+        },
+        `Reconnecting in ${delay}ms (attempt ${attempts})`,
+      );
+      setTimeout(() => {
+        reconnecting = false;
+        if (!stopped) connect();
+      }, delay);
+    };
+
+    const connect = () => {
+      if (stopped) return;
+      const sock = makeWASocket({
+        version,
+        logger,
+        auth: {
+          creds: state.creds,
+          keys: makeCacheableSignalKeyStore(state.keys, logger),
+        },
+        syncFullHistory: false,
+        shouldSyncHistoryMessage: () => false,
+        generateHighQualityLinkPreview: true,
+        shouldIgnoreJid: (jid) => isJidGroup(jid),
+      });
+      currentSock = sock;
+
+      detach = bindSocketEvents(
+        sessionId,
+        sock,
+        logger,
+        saveCreds,
+        onOpen,
+        onLoggedOut,
+        scheduleReconnect,
+        (qr) => {
+          sawQr = true;
+          hooks?.onQr?.(qr);
+        },
+      );
+    };
+
+    connect();
+
+    if (waitForOpen) {
+      await initialConnectionReady;
     }
-    attempts = 0;
-    const phoneJid = state.creds?.me?.id
-      ? jidNormalizedUser(state.creds.me.id)
-      : currentSock?.user?.id
-        ? jidNormalizedUser(currentSock.user.id)
-        : null;
-    hooks?.onOpen?.(phoneJid);
-  };
 
-  const onLoggedOut = () => {
-    if (connectionTimeout) clearTimeout(connectionTimeout);
-    rejectInitialConnection?.(new Error("Logged out"));
-    rejectInitialConnection = null;
-    resolveInitialConnection = null;
-    logger.error(
-      "Connection closed: Logged Out. Delete the session or create a new one to re-authenticate.",
-    );
-    hooks?.onClose?.(true);
-  };
-
-  const teardown = (dead: WhatsAppSocket) => {
-    if (currentSock === dead) {
-      currentSock = null;
-    }
-    try {
-      detach?.();
-    } catch {}
-    detach = null;
-    try {
-      dead.end(undefined);
-    } catch {}
-  };
-
-  const scheduleReconnect = (dead: WhatsAppSocket) => {
-    if (stopped || reconnecting) return;
-    reconnecting = true;
-    teardown(dead);
-    hooks?.onClose?.(false);
-    const delay = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * 2 ** attempts);
-    attempts++;
-    logger.info(`Reconnecting in ${delay}ms (attempt ${attempts})`);
-    setTimeout(() => {
-      reconnecting = false;
-      if (!stopped) connect();
-    }, delay);
-  };
-
-  const connect = () => {
-    if (stopped) return;
-    const sock = makeWASocket({
-      version,
-      logger,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger),
+    const socket = new Proxy({} as WhatsAppSocket, {
+      get(_target, prop) {
+        if (!currentSock) return undefined;
+        const value = (currentSock as any)[prop];
+        return typeof value === "function" ? value.bind(currentSock) : value;
       },
-      syncFullHistory: false,
-      shouldSyncHistoryMessage: () => false,
-      generateHighQualityLinkPreview: true,
-      shouldIgnoreJid: (jid) => isJidGroup(jid),
+      set(_target, prop, value) {
+        if (!currentSock) return true;
+        (currentSock as any)[prop] = value;
+        return true;
+      },
     });
-    currentSock = sock;
 
-    detach = bindSocketEvents(
-      sessionId,
-      sock,
-      logger,
-      saveCreds,
-      onOpen,
-      onLoggedOut,
-      scheduleReconnect,
-      hooks?.onQr,
-    );
-  };
+    const stop = () => {
+      stopped = true;
+      if (connectionTimeout) clearTimeout(connectionTimeout);
+      if (currentSock) teardown(currentSock);
+      lock.release();
+    };
 
-  connect();
-
-  if (waitForOpen) {
-    await initialConnectionReady;
+    return { socket, stop };
+  } catch (error) {
+    lock.release();
+    throw error;
   }
-
-  const socket = new Proxy({} as WhatsAppSocket, {
-    get(_target, prop) {
-      if (!currentSock) return undefined;
-      const value = (currentSock as any)[prop];
-      return typeof value === "function" ? value.bind(currentSock) : value;
-    },
-    set(_target, prop, value) {
-      if (!currentSock) return true;
-      (currentSock as any)[prop] = value;
-      return true;
-    },
-  });
-
-  const stop = () => {
-    stopped = true;
-    if (connectionTimeout) clearTimeout(connectionTimeout);
-    if (currentSock) teardown(currentSock);
-  };
-
-  return { socket, stop };
 }
 
 export async function disconnectWhatsAppSession(
