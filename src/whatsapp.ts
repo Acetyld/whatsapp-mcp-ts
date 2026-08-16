@@ -6,7 +6,9 @@ import {
   DisconnectReason,
   type WAMessage,
   type Contact,
-  type proto,
+  type GroupMetadata,
+  proto,
+  isJidBroadcast,
   isJidGroup,
   isJidUser,
   isLidUser,
@@ -26,6 +28,71 @@ import {
 import { acquireSessionLock, type SessionLock } from "./session-lock.ts";
 
 export type WhatsAppSocket = ReturnType<typeof makeWASocket>;
+
+type GroupMetadataCache = Map<string, GroupMetadata>;
+
+function storeGroupMetadata(
+  sessionId: string,
+  metadata: GroupMetadata,
+  cache: GroupMetadataCache,
+): void {
+  const jid = jidNormalizedUser(metadata.id);
+  cache.set(jid, metadata);
+  storeChat(sessionId, {
+    jid,
+    name: metadata.subject,
+  });
+}
+
+async function refreshGroupMetadata(
+  sessionId: string,
+  sock: WhatsAppSocket,
+  jid: string,
+  cache: GroupMetadataCache,
+  logger: P.Logger,
+): Promise<GroupMetadata | undefined> {
+  try {
+    const metadata = await sock.groupMetadata(jid);
+    storeGroupMetadata(sessionId, metadata, cache);
+    return metadata;
+  } catch (err) {
+    logger.warn({ err, jid }, "Failed to fetch group metadata");
+    return undefined;
+  }
+}
+
+async function seedParticipatingGroups(
+  sessionId: string,
+  sock: WhatsAppSocket,
+  cache: GroupMetadataCache,
+  logger: P.Logger,
+): Promise<void> {
+  try {
+    const groups = await sock.groupFetchAllParticipating();
+    const count = Object.keys(groups).length;
+    logger.info(`Fetched ${count} participating groups`);
+    for (const metadata of Object.values(groups)) {
+      storeGroupMetadata(sessionId, metadata, cache);
+    }
+  } catch (err) {
+    logger.warn({ err }, "Failed to fetch participating groups");
+  }
+}
+
+function storeGroupParticipantFromMessage(
+  sessionId: string,
+  msg: WAMessage,
+): void {
+  if (!msg.key?.remoteJid || !isJidGroup(msg.key.remoteJid)) return;
+  if (msg.key.fromMe || !msg.key.participant) return;
+
+  const participantJid = jidNormalizedUser(msg.key.participant);
+  storeContact(sessionId, {
+    jid: participantJid,
+    notify: msg.pushName?.trim() || null,
+    phoneNumber: phoneFromJid(participantJid),
+  });
+}
 
 export type ConnectionHooks = {
   onQr?: (qr: string) => void;
@@ -219,6 +286,7 @@ function bindSocketEvents(
     statusCode: number | undefined,
     errorMessage: string,
   ) => void,
+  groupCache: GroupMetadataCache,
   onQr?: (qr: string) => void,
 ): () => void {
   return sock.ev.process(async (events) => {
@@ -253,6 +321,7 @@ function bindSocketEvents(
       } else if (connection === "open") {
         logger.info(`Connection opened. WA user: ${sock.user?.name}`);
         onOpen();
+        void seedParticipatingGroups(sessionId, sock, groupCache, logger);
       }
     }
 
@@ -294,6 +363,20 @@ function bindSocketEvents(
       if (type === "notify") {
         for (const msg of messages) {
           storeContactFromMessage(sessionId, msg);
+          storeGroupParticipantFromMessage(sessionId, msg);
+
+          if (msg.key?.remoteJid && isJidGroup(msg.key.remoteJid)) {
+            const groupJid = jidNormalizedUser(msg.key.remoteJid);
+            if (!groupCache.has(groupJid)) {
+              void refreshGroupMetadata(
+                sessionId,
+                sock,
+                groupJid,
+                groupCache,
+                logger,
+              );
+            }
+          }
 
           const parsed = parseMessageForDb(msg);
           if (parsed) {
@@ -375,6 +458,43 @@ function bindSocketEvents(
           contactToStore(sessionId, contact as Contact),
         );
       }
+    }
+
+    if (events["groups.update"]) {
+      logger.info(
+        { count: events["groups.update"].length },
+        "Received groups.update event",
+      );
+      for (const update of events["groups.update"]) {
+        if (!update.id) continue;
+        const cached = groupCache.get(jidNormalizedUser(update.id));
+        if (cached && update.subject) {
+          storeGroupMetadata(sessionId, { ...cached, ...update }, groupCache);
+          continue;
+        }
+        void refreshGroupMetadata(
+          sessionId,
+          sock,
+          update.id,
+          groupCache,
+          logger,
+        );
+      }
+    }
+
+    if (events["group-participants.update"]) {
+      const event = events["group-participants.update"];
+      logger.info(
+        { groupId: event.id, action: event.action },
+        "Received group-participants.update event",
+      );
+      void refreshGroupMetadata(
+        sessionId,
+        sock,
+        event.id,
+        groupCache,
+        logger,
+      );
     }
   });
 }
@@ -573,6 +693,7 @@ export async function startWhatsAppConnection(options: {
 
     const connect = () => {
       if (stopped) return;
+      const groupCache: GroupMetadataCache = new Map();
       const sock = makeWASocket({
         version,
         logger,
@@ -583,7 +704,8 @@ export async function startWhatsAppConnection(options: {
         syncFullHistory: false,
         shouldSyncHistoryMessage: () => false,
         generateHighQualityLinkPreview: true,
-        shouldIgnoreJid: (jid) => isJidGroup(jid),
+        shouldIgnoreJid: (jid) => isJidBroadcast(jid),
+        cachedGroupMetadata: async (jid) => groupCache.get(jid),
       });
       currentSock = sock;
 
@@ -595,6 +717,7 @@ export async function startWhatsAppConnection(options: {
         onOpen,
         onLoggedOut,
         scheduleReconnect,
+        groupCache,
         (qr) => {
           sawQr = true;
           hooks?.onQr?.(qr);
