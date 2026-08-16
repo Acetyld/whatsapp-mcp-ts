@@ -4,6 +4,7 @@ import { startMcpServer } from "./mcp.ts";
 import {
   initSessionManager,
   restoreSessions,
+  stopAllSessions,
 } from "./sessions.ts";
 
 const dataDir = process.env.WHATSAPP_MCP_DATA_DIR || ".";
@@ -56,6 +57,12 @@ async function main() {
 
 async function shutdown(signal: string) {
   mcpLogger.info(`Received ${signal}. Shutting down gracefully...`);
+
+  try {
+    stopAllSessions();
+  } catch (error) {
+    mcpLogger.warn({ err: error }, "Error while stopping WhatsApp sessions");
+  }
 
   waLogger.flush();
   mcpLogger.flush();
